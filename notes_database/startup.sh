@@ -142,6 +142,144 @@ export POSTGRES_DB="${DB_NAME}"
 export POSTGRES_PORT="${DB_PORT}"
 EOF
 
+# -------------------------
+# Repeatable schema init
+# -------------------------
+echo ""
+echo "Initializing notes app schema (idempotent)..."
+
+# Use the connection string from db_connection.txt as required.
+DB_CONN=$(cat db_connection.txt)
+
+# Small helper to run SQL reliably
+run_sql () {
+    local sql="$1"
+    # Use ON_ERROR_STOP to fail fast if something is wrong
+    ${DB_CONN} -v ON_ERROR_STOP=1 -c "$sql"
+}
+
+# Extensions needed for case-insensitive email uniqueness, UUIDs, and search indexing
+run_sql "CREATE EXTENSION IF NOT EXISTS citext;"
+run_sql "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+run_sql "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+# Core tables
+run_sql "
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email CITEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login_at TIMESTAMPTZ NULL
+);
+"
+
+# Ensure case-insensitive uniqueness for email
+run_sql "CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users (email);"
+
+run_sql "
+CREATE TABLE IF NOT EXISTS notes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    content_markdown TEXT NOT NULL DEFAULT '',
+    -- searchable tsvector; maintained via trigger below
+    search_vector TSVECTOR NOT NULL DEFAULT ''::tsvector,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    archived_at TIMESTAMPTZ NULL
+);
+"
+
+run_sql "
+CREATE TABLE IF NOT EXISTS tags (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"
+
+# A user cannot have duplicate tag names (case-insensitive)
+run_sql "CREATE UNIQUE INDEX IF NOT EXISTS tags_user_name_uidx ON tags (user_id, lower(name));"
+
+run_sql "
+CREATE TABLE IF NOT EXISTS note_tags (
+    note_id UUID NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    tag_id UUID NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (note_id, tag_id)
+);
+"
+
+# updated_at auto-maintenance (idempotent create/replace)
+run_sql "
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"
+
+run_sql "DROP TRIGGER IF EXISTS trg_notes_set_updated_at ON notes;"
+run_sql "
+CREATE TRIGGER trg_notes_set_updated_at
+BEFORE UPDATE ON notes
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+"
+
+# search_vector auto-maintenance
+run_sql "
+CREATE OR REPLACE FUNCTION notes_search_vector_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(NEW.content, '')), 'B') ||
+        setweight(to_tsvector('english', coalesce(NEW.content_markdown, '')), 'C');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"
+
+run_sql "DROP TRIGGER IF EXISTS trg_notes_search_vector ON notes;"
+run_sql "
+CREATE TRIGGER trg_notes_search_vector
+BEFORE INSERT OR UPDATE OF title, content, content_markdown ON notes
+FOR EACH ROW
+EXECUTE FUNCTION notes_search_vector_update();
+"
+
+# Backfill search_vector for any existing rows (safe to run repeatedly)
+run_sql "
+UPDATE notes
+SET search_vector =
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(content, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(content_markdown, '')), 'C');
+"
+
+# Indexes for performance
+run_sql "CREATE INDEX IF NOT EXISTS notes_user_created_at_idx ON notes (user_id, created_at DESC);"
+run_sql "CREATE INDEX IF NOT EXISTS notes_user_updated_at_idx ON notes (user_id, updated_at DESC);"
+run_sql "CREATE INDEX IF NOT EXISTS notes_archived_at_idx ON notes (archived_at);"
+run_sql "CREATE INDEX IF NOT EXISTS note_tags_tag_id_idx ON note_tags (tag_id);"
+run_sql "CREATE INDEX IF NOT EXISTS note_tags_note_id_idx ON note_tags (note_id);"
+
+# Full-text search index
+run_sql "CREATE INDEX IF NOT EXISTS notes_search_vector_gin_idx ON notes USING GIN (search_vector);"
+
+# Fast partial / fuzzy search for title/content (pg_trgm)
+run_sql "CREATE INDEX IF NOT EXISTS notes_title_trgm_idx ON notes USING GIN (title gin_trgm_ops);"
+run_sql "CREATE INDEX IF NOT EXISTS notes_content_trgm_idx ON notes USING GIN (content gin_trgm_ops);"
+
+echo "✓ Notes app schema initialized."
+echo ""
+
 echo "PostgreSQL setup complete!"
 echo "Database: ${DB_NAME}"
 echo "User: ${DB_USER}"
